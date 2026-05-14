@@ -2,157 +2,94 @@ class BusinessLogicLayer {
     constructor(data) {
         this.data = data;
         this.currentUser = null;
+        // store staff's active working zone per session (not stored in User entity)
+        this.currentUserZone = null;
     }
 
     authenticate(login, password) {
         const user = this.data.findUser(login);
         if (user && user.password === password) {
             this.currentUser = user;
+            this.currentUserZone = null;
             return { success: true, role: user.role };
         }
         return { success: false };
     }
 
+    setStaffZone(zone) {
+        this.currentUserZone = zone;
+    }
+
     getStaffZone() {
-        if (this.currentUser) {
-            const event = this.data.getEvent();
-            return this.data.getUserZoneForEvent(this.currentUser.login, event.id);
-        }
-        return null;
+        return this.currentUserZone;
     }
 
     getCurrentUser() {
         return this.currentUser;
     }
 
-    getCurrentEventId() {
-        const event = this.data.getEvent();
-        return event ? event.id : null;
-    }
-
-    getInsideCount() {
-        return this.data.getInsideCount();
-    }
-
-    // Zone assignment by admin
-    assignZoneToStaff(staffLogin, zone) {
-        if (this.currentUser?.role !== 'engineer') return { success: false };
-        const event = this.data.getEvent();
-        if (this.data.assignZoneToUser(staffLogin, zone, event.id)) {
-            return { success: true };
-        }
-        return { success: false };
-    }
-
-    // Event Management
-    createEvent(name, zones, max_capacity) {
-        if (this.currentUser?.role !== 'engineer') return { success: false };
-        const eventId = this.data.createEvent(name, zones, max_capacity);
-        return { success: true, eventId };
-    }
-
-    switchEvent(eventId) {
-        if (this.currentUser?.role !== 'engineer') return { success: false };
-        if (this.data.setCurrentEvent(eventId)) {
-            return { success: true };
-        }
-        return { success: false };
-    }
-
-    getCurrentEvent() {
-        return this.data.getEvent();
-    }
-
-    getCurrentEventSummary() {
-        const event = this.data.getEvent();
-        if (!event) {
-            return null;
-        }
-
-        return {id: event.id, name: event.name, status: event.status, max_capacity: event.max_capacity, insideCount: this.data.getInsideCount(event.id)};
-    }
-
-    getCurrentEventZones() {
-        const event = this.data.getEvent();
-        return event ? event.zones : [];
-    }
-
-    getAllEvents() {
-        return this.data.getAllEvents();
-    }
-
-    // Advanced Access Control with Zone Checking
+    // Access processing using denormalized ticket/event data
     processAccess(ticketCode) {
-        const event = this.data.getEvent();
-        const visitor = this.data.getVisitor(ticketCode);
+        const ticket = this.data.getTicket(ticketCode);
         const currentZone = this.getStaffZone();
 
-        // Check 1: Event active
-        if (event.status !== "Активное") {
-            this.data.saveIncident("Доступ", "Средняя", "Событие неактивно", currentZone || "Неизвестно", this.currentUser?.login);
-            return { success: false, msg: "Событие завершено" };
-        }
-
-        // Check 2: Ticket exists
-        if (!visitor) {
-            this.data.saveIncident("Безопасность", "Средняя", "Неизвестный билет: " + ticketCode, currentZone || "Неизвестно", this.currentUser?.login);
+        // Check 1: Ticket exists
+        if (!ticket) {
+            this.data.saveIncident("Access", "Low", "Unknown ticket: " + ticketCode, this.currentUser?.login);
             return { success: false, msg: "Билет не найден" };
         }
 
-        // Check 3: Not already inside
-        if (visitor.is_inside) {
-            this.data.saveIncident("Безопасность", "Высокая", "Двойной вход: " + ticketCode, visitor.assigned_zone, this.currentUser?.login);
+        // Check 2: Already inside
+        if (ticket.is_inside) {
+            this.data.saveIncident("Security", "High", "Duplicate entry: " + ticketCode, this.currentUser?.login);
             return { success: false, msg: "Повторный вход", alert: true };
         }
 
-        // Check 4: Capacity available
-        if (this.data.getInsideCount() >= event.max_capacity) {
-            this.data.saveIncident("Доступ", "Средняя", "Вместимость превышена", currentZone || "Неизвестно", this.currentUser?.login);
+        // Check 3: Capacity for the event
+        const insideCount = this.data.getInsideCountForEvent(ticket.event_name);
+        if (insideCount >= ticket.event_max_capacity) {
+            this.data.saveIncident("Access", "Low", "Capacity exceeded for event: " + ticket.event_name, this.currentUser?.login);
             return { success: false, msg: "Нет мест" };
         }
 
-        // Check 5: Zone match
-        if (currentZone && visitor.assigned_zone !== currentZone) {
-            this.data.saveIncident("Безопасность", "Высокая", "Несоответствие зон: билет для " + visitor.assigned_zone + ", сканирован в " + currentZone, currentZone, this.currentUser?.login);
-            return { success: false, msg: "Доступ запрещен: билет для зоны \"" + visitor.assigned_zone + "\"", alert: true };
+        // Check 4: Zone match (if staff set a zone)
+        if (currentZone && ticket.assigned_zone !== currentZone) {
+            this.data.saveIncident("Security", "High", "Zone mismatch for ticket " + ticketCode + ": expected " + ticket.assigned_zone + ", scanned at " + currentZone, this.currentUser?.login);
+            return { success: false, msg: "Доступ запрещен: билет для зоны \"" + ticket.assigned_zone + "\"", alert: true };
         }
 
-        // All checks passed
-        visitor.is_inside = true;
-        return { success: true, msg: "Вход разрешен", zone: visitor.assigned_zone };
+        // All good — mark inside
+        this.data.markTicketInside(ticketCode);
+        return { success: true, msg: "Вход разрешен", zone: ticket.assigned_zone };
+    }
+
+    // Engineer-only: register new ticket
+    registerTicket(ticket_code, owner_name, phone, event_name, assigned_zone, event_max_capacity) {
+        if (this.currentUser?.role !== 'engineer') return { success: false };
+        const t = this.data.addTicket(ticket_code, owner_name, phone, event_name, assigned_zone, event_max_capacity);
+        if (!t) return { success: false, msg: 'Ticket exists' };
+        return { success: true, ticket: t };
     }
 
     registerUser(login, pass, role) {
-        if (this.currentUser?.role !== 'engineer') return false;
+        if (this.currentUser?.role !== 'engineer') return { success: false };
         this.data.saveUser(login, pass, role);
-        return true;
+        return { success: true };
     }
 
-    // Manual Incident Reporting
-    reportIncident(type, severity, description, zone) {
-        if (!this.currentUser || (this.currentUser.role !== 'employee' && this.currentUser.role !== 'engineer')) {
-            return { success: false };
-        }
-        
-        this.data.saveIncident(type, severity, description, zone, this.currentUser.login);
-        const shouldAlert = severity === "Высокая";
-        
-        return { 
-            success: true, 
-            alert: shouldAlert,
-            msg: shouldAlert ? "[ALERT] " + type + " - " + severity + " в " + zone : undefined
-        };
+    reportIncident(type, severity, description) {
+        if (!this.currentUser) return { success: false };
+        const inc = this.data.saveIncident(type, severity, description, this.currentUser.login);
+        return { success: true, incident: inc, alert: severity === 'High' };
     }
 
     getIncidents() {
-        return this.data.incidents;
+        return this.data.getIncidents();
     }
 
-    // Audit methods
-    getAllVisitors() {
+    getAllTickets() {
         if (this.currentUser?.role !== 'engineer') return null;
-        const event = this.data.getEvent();
-        return this.data.getAllVisitors(event.id);
+        return this.data.getAllTickets();
     }
 
     getAllStaff() {
@@ -162,6 +99,7 @@ class BusinessLogicLayer {
 
     logout() {
         this.currentUser = null;
+        this.currentUserZone = null;
     }
 }
 
